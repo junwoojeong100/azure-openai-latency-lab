@@ -5,6 +5,7 @@ Uses Azure OpenAI SDK with chat.completions.create()
 """
 
 import os
+import re
 import time
 from typing import Dict, List
 from datetime import datetime
@@ -16,6 +17,64 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+# Deployments whose names match this pattern support the reasoning_effort parameter
+# (GPT-5 series and newer: gpt-5, gpt-5.1, gpt-5.2, gpt-5.4, gpt-5.4-mini, ...).
+REASONING_MODEL_PATTERN = re.compile(r"gpt-5", re.IGNORECASE)
+
+# Reasoning effort levels to sweep for each 5.x model.
+# Valid values for the GPT-5.x series: none, minimal, low, medium, high.
+# Ordered from highest reasoning intensity to lowest so the heaviest runs execute first.
+DEFAULT_REASONING_EFFORTS = ["high", "medium", "low", "minimal", "none"]
+
+# Relative reasoning intensity used to order efforts (higher = more reasoning).
+REASONING_EFFORT_INTENSITY = {"none": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4}
+
+
+def is_reasoning_model(deployment_name: str) -> bool:
+    """Return True if a deployment supports the reasoning_effort parameter."""
+    return bool(deployment_name) and bool(REASONING_MODEL_PATTERN.search(deployment_name))
+
+
+def get_reasoning_efforts(env: Dict[str, str] = None) -> List[str]:
+    """Reasoning effort levels to test, from REASONING_EFFORTS (comma-separated) or defaults.
+
+    The list is always ordered from highest reasoning intensity to lowest
+    (high -> medium -> low -> minimal -> none) so the heaviest configurations run first.
+    Unknown effort names are placed last.
+    """
+    env = env if env is not None else os.environ
+    raw = env.get("REASONING_EFFORTS", ",".join(DEFAULT_REASONING_EFFORTS))
+    efforts = [e.strip() for e in raw.split(",") if e.strip()]
+    efforts = efforts or list(DEFAULT_REASONING_EFFORTS)
+    return sorted(efforts, key=lambda e: REASONING_EFFORT_INTENSITY.get(e.lower(), -1), reverse=True)
+
+
+def build_model_configs(env: Dict[str, str] = None, efforts: List[str] = None) -> Dict[str, object]:
+    """Build a {label: deployment} map from every GPT_*_DEPLOYMENT_NAME entry in the env.
+
+    Non-reasoning models (e.g. gpt-4.1) map to a plain deployment name. Each 5.x reasoning
+    model is expanded into one entry per reasoning effort level so latency can be measured
+    across all settable efforts, e.g. ``gpt-5.4 (high)`` -> ("gpt-5.4", "high").
+    """
+    env = env if env is not None else os.environ
+    efforts = efforts if efforts is not None else get_reasoning_efforts(env)
+
+    configs: Dict[str, object] = {}
+    seen = set()
+    for key in sorted(env.keys()):
+        if not (key.startswith("GPT_") and key.endswith("_DEPLOYMENT_NAME")):
+            continue
+        deployment = (env.get(key) or "").strip()
+        if not deployment or deployment in seen:
+            continue
+        seen.add(deployment)
+
+        if is_reasoning_model(deployment):
+            for effort in efforts:
+                configs[f"{deployment} ({effort})"] = (deployment, effort)
+        else:
+            configs[deployment] = deployment
+    return configs
 
 
 
@@ -50,27 +109,35 @@ class LatencyTester:
         )
         
         print(f"API Version: 2024-08-01-preview\n")
-        
-        # Model deployment names - 모든 배포된 모델 및 reasoning effort 조합
-        self.models = {
-            # GPT-4 시리즈 (non-reasoning models)
-            "gpt-4.1": os.getenv("GPT_41_DEPLOYMENT_NAME", "gpt-4.1"),
 
-            # GPT-5.4 시리즈 - reasoning_effort 파라미터 지원 (low/medium/high/minimal)
-            #"gpt-5.4-high": (os.getenv("GPT_54_DEPLOYMENT_NAME", "gpt-5.4"), "high"),
-            #"gpt-5.4-medium": (os.getenv("GPT_54_DEPLOYMENT_NAME", "gpt-5.4"), "medium"),
-            #"gpt-5.4-low": (os.getenv("GPT_54_DEPLOYMENT_NAME", "gpt-5.4"), "low"),
-            "gpt-5.4-minimal": (os.getenv("GPT_54_DEPLOYMENT_NAME", "gpt-5.4"), "minimal"),
-            #"gpt-5.4-none": (os.getenv("GPT_54_DEPLOYMENT_NAME", "gpt-5.4"), "none"),
-            #"gpt-5.4-default": os.getenv("GPT_54_DEPLOYMENT_NAME", "gpt-5.4"),
-            
-            #"gpt-5.4-mini-high": (os.getenv("GPT_54_MINI_DEPLOYMENT_NAME", "gpt-5.4-mini"), "high"),
-            #"gpt-5.4-mini-medium": (os.getenv("GPT_54_MINI_DEPLOYMENT_NAME", "gpt-5.4-mini"), "medium"),
-            #"gpt-5.4-mini-low": (os.getenv("GPT_54_MINI_DEPLOYMENT_NAME", "gpt-5.4-mini"), "low"),
-            "gpt-5.4-mini-minimal": (os.getenv("GPT_54_MINI_DEPLOYMENT_NAME", "gpt-5.4-mini"), "minimal"),
-            #"gpt-5.4-mini-none": (os.getenv("GPT_54_MINI_DEPLOYMENT_NAME", "gpt-5.4-mini"), "none"),
-            "gpt-5.4-mini-default": os.getenv("GPT_54_MINI_DEPLOYMENT_NAME", "gpt-5.4-mini"),
-        }
+        # Reasoning effort levels to sweep for each 5.x model (configurable via REASONING_EFFORTS)
+        self.reasoning_efforts = get_reasoning_efforts()
+
+        # Model configurations built dynamically from every GPT_*_DEPLOYMENT_NAME in .env:
+        #   - Non-reasoning models (e.g. gpt-4.1) are tested as-is.
+        #   - Each 5.x model is expanded into one entry per reasoning effort level.
+        self.models = build_model_configs(efforts=self.reasoning_efforts)
+
+        if not self.models:
+            raise ValueError(
+                "No model deployments found. Set GPT_*_DEPLOYMENT_NAME entries in your .env file."
+            )
+
+        reasoning_models = sorted({
+            info[0] for info in self.models.values() if isinstance(info, tuple)
+        })
+        plain_models = sorted({
+            info for info in self.models.values() if not isinstance(info, tuple)
+        })
+
+        print("Model configurations:")
+        if reasoning_models:
+            print(f"  Reasoning (5.x) models: {', '.join(reasoning_models)}")
+            print(f"  Reasoning efforts swept: {', '.join(self.reasoning_efforts)}")
+        if plain_models:
+            print(f"  Standard models:        {', '.join(plain_models)}")
+        print(f"  Total test configurations: {len(self.models)}\n")
+
         
         # Test prompts - varied complexity (5 prompts for comprehensive testing)
         self.test_prompts = [
@@ -81,15 +148,15 @@ class LatencyTester:
     
     def test_model_latency(self, model_name: str, deployment_info, prompt: str) -> Dict:
         """Test latency for a single model with a single prompt"""
+        # deployment_info가 튜플이면 (deployment_name, reasoning_effort) 형태
+        if isinstance(deployment_info, tuple):
+            deployment_name, reasoning_effort = deployment_info
+        else:
+            deployment_name = deployment_info
+            reasoning_effort = None
+
         try:
             start_time = time.time()
-            
-            # deployment_info가 튜플이면 (deployment_name, reasoning_effort) 형태
-            if isinstance(deployment_info, tuple):
-                deployment_name, reasoning_effort = deployment_info
-            else:
-                deployment_name = deployment_info
-                reasoning_effort = None
             
             client = self.client
             
@@ -107,30 +174,12 @@ class LatencyTester:
                 "messages": messages
             }
             
-            # Add reasoning_effort parameter for GPT-5/5.4 models
+            # Add reasoning_effort parameter for GPT-5/5.x models
             if reasoning_effort is not None:
                 params["reasoning_effort"] = reasoning_effort
             
             # Create chat completion - no fallback, let errors surface
             response = client.chat.completions.create(**params)
-            
-            # Print reasoning_effort info only when 'none' is requested
-            if reasoning_effort == "none":
-                if hasattr(response, 'usage') and hasattr(response.usage, 'reasoning_tokens'):
-                    print(f"  Reasoning tokens with 'none': {response.usage.reasoning_tokens}")
-                
-                # Print actual reasoning_effort value from response if available
-                if hasattr(response, 'reasoning_effort'):
-                    print(f"  Response reasoning_effort: {response.reasoning_effort}")
-                elif hasattr(response.choices[0].message, 'reasoning_effort'):
-                    print(f"  Message reasoning_effort: {response.choices[0].message.reasoning_effort}")
-                else:
-                    # Check if it's in the response dict
-                    response_dict = response.model_dump() if hasattr(response, 'model_dump') else {}
-                    if 'reasoning_effort' in response_dict:
-                        print(f"  Default reasoning_effort from response: {response_dict['reasoning_effort']}")
-                    else:
-                        print(f"  No reasoning_effort field found in response")
             
             end_time = time.time()
             latency = (end_time - start_time) * 1000  # Convert to milliseconds
@@ -138,13 +187,22 @@ class LatencyTester:
             # Extract response
             response_content = response.choices[0].message.content if response.choices else ""
             
+            # Reasoning tokens are nested under completion_tokens_details for reasoning models
+            reasoning_tokens = None
+            if response.usage is not None:
+                details = getattr(response.usage, "completion_tokens_details", None)
+                if details is not None:
+                    reasoning_tokens = getattr(details, "reasoning_tokens", None)
+            
             return {
                 "model": model_name,
                 "prompt": prompt,
+                "reasoning_effort": reasoning_effort,
                 "latency_ms": round(latency, 2),
                 "tokens": response.usage.total_tokens if response.usage else None,
                 "completion_tokens": response.usage.completion_tokens if response.usage else None,
                 "prompt_tokens": response.usage.prompt_tokens if response.usage else None,
+                "reasoning_tokens": reasoning_tokens,
                 "response": response_content[:100],
                 "success": True,
                 "error": None
@@ -154,10 +212,12 @@ class LatencyTester:
             return {
                 "model": model_name,
                 "prompt": prompt,
+                "reasoning_effort": reasoning_effort,
                 "latency_ms": None,
                 "tokens": None,
                 "completion_tokens": None,
                 "prompt_tokens": None,
+                "reasoning_tokens": None,
                 "response": None,
                 "success": False,
                 "error": str(e)
@@ -221,8 +281,12 @@ class LatencyTester:
         print(f"{'='*80}\n")
 
         for model_name, deployment_info in self.models.items():
+            effort = deployment_info[1] if isinstance(deployment_info, tuple) else None
+            header = f"Testing: {model_name}"
+            if effort is not None:
+                header += f"  (reasoning_effort={effort})"
             print(f"\n{'='*80}")
-            print(f"Testing: {model_name}")
+            print(header)
             print(f"{'='*80}")
             
             for i, prompt in enumerate(self.test_prompts, 1):
@@ -237,7 +301,10 @@ class LatencyTester:
                     if result["success"]:
                         print(f"\n💬 Response: {result['response']}")
                         print(f"⏱️  Latency: {result['latency_ms']:.0f}ms")
-                        print(f"🔢 Tokens - Total: {result['tokens']}, Prompt: {result['prompt_tokens']}, Completion: {result['completion_tokens']}")
+                        reasoning_str = ""
+                        if result.get("reasoning_tokens") is not None:
+                            reasoning_str = f", Reasoning: {result['reasoning_tokens']}"
+                        print(f"🔢 Tokens - Total: {result['tokens']}, Prompt: {result['prompt_tokens']}, Completion: {result['completion_tokens']}{reasoning_str}")
                     else:
                         print(f"\n❌ Failed: {result.get('error', 'Unknown error')}")
                     
@@ -258,7 +325,10 @@ class LatencyTester:
                 print(f"Prompt: {result['prompt']}")
                 print(f"Response: {result['response']}")
                 print(f"Latency: {result['latency_ms']:.0f}ms")
-                print(f"Tokens - Total: {result['tokens']}, Prompt: {result['prompt_tokens']}, Completion: {result['completion_tokens']}")
+                reasoning_str = ""
+                if result.get("reasoning_tokens") is not None:
+                    reasoning_str = f", Reasoning: {result['reasoning_tokens']}"
+                print(f"Tokens - Total: {result['tokens']}, Prompt: {result['prompt_tokens']}, Completion: {result['completion_tokens']}{reasoning_str}")
                 print("-" * 80)
         
         print(f"\n{'='*80}")
@@ -278,12 +348,14 @@ class LatencyTester:
                 if model not in model_stats:
                     model_stats[model] = {"latencies": []}
                     model_prompt_stats[model] = {}
-                    model_token_stats[model] = {"total": [], "prompt": [], "completion": []}
+                    model_token_stats[model] = {"total": [], "prompt": [], "completion": [], "reasoning": []}
                 
                 model_stats[model]["latencies"].append(result["latency_ms"])
                 model_token_stats[model]["total"].append(result["tokens"])
                 model_token_stats[model]["prompt"].append(result["prompt_tokens"])
                 model_token_stats[model]["completion"].append(result["completion_tokens"])
+                if result.get("reasoning_tokens") is not None:
+                    model_token_stats[model]["reasoning"].append(result["reasoning_tokens"])
                 
                 if prompt not in model_prompt_stats[model]:
                     model_prompt_stats[model][prompt] = []
@@ -307,8 +379,8 @@ class LatencyTester:
         print(f"\n{'='*80}")
         print("OVERALL STATISTICS")
         print(f"{'='*80}\n")
-        print(f"{'Model':<30} {'Avg (ms)':<12} {'Min (ms)':<12} {'Max (ms)':<12} {'Std Dev':<12} {'Avg Tokens':<12} {'Tests':<8}")
-        print("-" * 110)
+        print(f"{'Model':<30} {'Avg (ms)':<12} {'Min (ms)':<12} {'Max (ms)':<12} {'Std Dev':<12} {'Avg Tokens':<12} {'Avg Reason':<12} {'Tests':<8}")
+        print("-" * 122)
         
         for model, stats in sorted_models:
             latencies = stats["latencies"]
@@ -323,7 +395,11 @@ class LatencyTester:
             # Calculate average tokens
             avg_tokens = sum(model_token_stats[model]["total"]) / len(model_token_stats[model]["total"])
             
-            print(f"{model:<30} {avg_latency:<12.2f} {min_latency:<12.2f} {max_latency:<12.2f} {std_dev:<12.2f} {avg_tokens:<12.1f} {len(latencies):<8}")
+            # Calculate average reasoning tokens (reasoning models only)
+            reasoning_vals = model_token_stats[model]["reasoning"]
+            avg_reasoning = f"{sum(reasoning_vals) / len(reasoning_vals):.1f}" if reasoning_vals else "-"
+            
+            print(f"{model:<30} {avg_latency:<12.2f} {min_latency:<12.2f} {max_latency:<12.2f} {std_dev:<12.2f} {avg_tokens:<12.1f} {avg_reasoning:<12} {len(latencies):<8}")
         
         # Error summary
         errors = [r for r in results if not r["success"]]
@@ -331,8 +407,16 @@ class LatencyTester:
             print(f"\n{'='*80}")
             print(f"ERRORS ({len(errors)} total)")
             print(f"{'='*80}\n")
+            # De-duplicate identical (model, error) pairs to keep the summary readable
+            seen_errors = set()
             for error in errors:
-                print(f"Model: {error['model']}")
+                key = (error['model'], error['error'])
+                if key in seen_errors:
+                    continue
+                seen_errors.add(key)
+                effort = error.get('reasoning_effort')
+                effort_str = f" (reasoning_effort={effort})" if effort is not None else ""
+                print(f"Model: {error['model']}{effort_str}")
                 print(f"Error: {error['error']}\n")
     
     def save_results(self, results: List[Dict], filename: str = "latency_results.csv"):
