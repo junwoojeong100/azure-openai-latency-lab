@@ -61,11 +61,16 @@ class ModelConfigurationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "minimal"):
             get_reasoning_efforts({"REASONING_EFFORTS": "high,minimal"})
 
+    def test_responses_only_max_effort_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "max"):
+            get_reasoning_efforts({"REASONING_EFFORTS": "max"})
+
     def test_capabilities_do_not_depend_on_deployment_name(self):
         configurations = build_model_configs(
             {
                 "GPT_51_DEPLOYMENT_NAME": "arbitrary-prod-a",
                 "GPT_54_DEPLOYMENT_NAME": "arbitrary-prod-b",
+                "GPT_56_SOL_DEPLOYMENT_NAME": "arbitrary-prod-c",
             },
             efforts=["xhigh", "none"],
         )
@@ -75,7 +80,40 @@ class ModelConfigurationTests(unittest.TestCase):
                 TestConfiguration("gpt-5.1", "arbitrary-prod-a", "none"),
                 TestConfiguration("gpt-5.4", "arbitrary-prod-b", "xhigh"),
                 TestConfiguration("gpt-5.4", "arbitrary-prod-b", "none"),
+                TestConfiguration("gpt-5.6-sol", "arbitrary-prod-c", "xhigh"),
+                TestConfiguration("gpt-5.6-sol", "arbitrary-prod-c", "none"),
             ],
+        )
+
+    def test_all_gpt_56_models_support_xhigh_effort(self):
+        cases = {
+            "GPT_56_SOL_DEPLOYMENT_NAME": "gpt-5.6-sol",
+            "GPT_56_TERRA_DEPLOYMENT_NAME": "gpt-5.6-terra",
+            "GPT_56_LUNA_DEPLOYMENT_NAME": "gpt-5.6-luna",
+        }
+        for env_key, model_id in cases.items():
+            with self.subTest(model=model_id):
+                self.assertEqual(
+                    build_model_configs(
+                        {env_key: f"{model_id}-deployment"},
+                        efforts=["xhigh"],
+                    ),
+                    [
+                        TestConfiguration(
+                            model_id,
+                            f"{model_id}-deployment",
+                            "xhigh",
+                        )
+                    ],
+                )
+
+    def test_gpt_56_chat_effort_matrix(self):
+        configurations = build_model_configs(
+            {"GPT_56_TERRA_DEPLOYMENT_NAME": "terra-deployment"}
+        )
+        self.assertEqual(
+            [item.reasoning_effort for item in configurations],
+            ["xhigh", "high", "medium", "low", "none"],
         )
 
     def test_legacy_mixed_case_gpt_4o_key_is_supported(self):
