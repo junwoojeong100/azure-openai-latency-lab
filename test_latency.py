@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import os
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -24,6 +26,13 @@ DEFAULT_TOKEN_SCOPE = "https://ai.azure.com/.default"
 DEFAULT_MAX_OUTPUT_TOKENS = 4096
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 120.0
 DEFAULT_MAX_RETRIES = 0
+AZURE_OPENAI_HOST_SUFFIXES = (
+    ".openai.azure.com",
+    ".services.ai.azure.com",
+)
+AZURE_RESOURCE_NAME_PATTERN = re.compile(
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+)
 
 CSV_FIELDS = (
     "model",
@@ -115,9 +124,47 @@ def normalize_azure_openai_base_url(endpoint: str) -> str:
         raise ValueError("Azure OpenAI endpoint must be an absolute HTTPS URL.")
     if parsed.query or parsed.fragment:
         raise ValueError("Azure OpenAI endpoint must not contain a query or fragment.")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("Azure OpenAI endpoint must not contain credentials.")
+
+    hostname = parsed.hostname
+    host_suffix = next(
+        (
+            suffix
+            for suffix in AZURE_OPENAI_HOST_SUFFIXES
+            if hostname is not None and hostname.endswith(suffix)
+        ),
+        None,
+    )
+    if hostname is None or host_suffix is None:
+        allowed_hosts = ", ".join(f"*{suffix}" for suffix in AZURE_OPENAI_HOST_SUFFIXES)
+        raise ValueError(
+            f"Azure OpenAI endpoint host must match one of: {allowed_hosts}."
+        )
+    resource_name = hostname[: -len(host_suffix)]
+    if AZURE_RESOURCE_NAME_PATTERN.fullmatch(resource_name) is None:
+        raise ValueError(
+            "Azure OpenAI endpoint must contain a valid Azure resource name."
+        )
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("Azure OpenAI endpoint contains an invalid port.") from error
+    if port not in (None, 443):
+        raise ValueError("Azure OpenAI endpoint may only use HTTPS port 443.")
 
     path = parsed.path.rstrip("/")
-    if path.startswith("/api/projects/"):
+    if path.startswith("/api/projects"):
+        parts = path.split("/")
+        if (
+            host_suffix != ".services.ai.azure.com"
+            or len(parts) != 4
+            or not parts[3]
+        ):
+            raise ValueError(
+                "Foundry project endpoint must use "
+                "https://<resource>.services.ai.azure.com/api/projects/<project>."
+            )
         path = ""
     elif path not in ("", "/openai/v1"):
         raise ValueError(
@@ -125,7 +172,7 @@ def normalize_azure_openai_base_url(endpoint: str) -> str:
             "endpoint, or a URL ending in /openai/v1/."
         )
 
-    return f"{parsed.scheme}://{parsed.netloc}/openai/v1/"
+    return f"{parsed.scheme}://{hostname}/openai/v1/"
 
 
 def get_endpoint(env: Mapping[str, str]) -> tuple[str, str]:
@@ -173,18 +220,19 @@ def normalize_model_environment(env: Mapping[str, str]) -> dict[str, str]:
         ):
             continue
 
+        normalized_value = value.strip()
         previous_value = normalized.get(normalized_key)
         if (
             previous_value is not None
-            and previous_value.strip()
-            and value.strip()
-            and previous_value != value
+            and previous_value
+            and normalized_value
+            and previous_value != normalized_value
         ):
             raise ValueError(
                 f"Conflicting values for {original_keys[normalized_key]} and {key}."
             )
-        if previous_value is None or value.strip():
-            normalized[normalized_key] = value
+        if previous_value is None or normalized_value:
+            normalized[normalized_key] = normalized_value
             original_keys[normalized_key] = key
     return normalized
 
@@ -308,8 +356,8 @@ def get_positive_float(
         value = float(raw)
     except ValueError as error:
         raise ValueError(f"{key} must be a number.") from error
-    if value <= 0:
-        raise ValueError(f"{key} must be greater than 0.")
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{key} must be a finite number greater than 0.")
     return value
 
 

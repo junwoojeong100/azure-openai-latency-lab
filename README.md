@@ -85,6 +85,11 @@ GPT_54_DEPLOYMENT_NAME=my-gpt-54-deployment
 - Foundry 프로젝트: `https://<resource>.services.ai.azure.com/api/projects/<project>`
 - 완성된 v1 URL: 위 리소스 URL 뒤에 `/openai/v1/`을 붙인 형식
 
+Entra 토큰이 잘못된 호스트로 전송되지 않도록 공개 Azure의
+`*.openai.azure.com`, `*.services.ai.azure.com` 호스트만 허용합니다. URL에
+사용자 정보나 비밀번호를 포함할 수 없으며, 포트를 명시할 때는 `443`만
+허용합니다.
+
 프로젝트 엔드포인트만 알고 있다면 기존 호환 변수도 사용할 수 있습니다.
 
 ```dotenv
@@ -162,6 +167,7 @@ prompt_tokens,reasoning_tokens,response,finish_reason,success,error,iteration,ti
 | `401` 또는 `403` | `az login` 상태, 구독/테넌트, `Cognitive Services OpenAI User` 역할, 토큰 scope |
 | `404` 또는 deployment not found | `.env` 값이 모델 ID가 아니라 실제 Azure **배포 이름**인지 확인 |
 | endpoint 형식 오류 | 리소스 엔드포인트 또는 `/api/projects/<project>` 형식을 사용했는지 확인 |
+| 사용자 지정 프록시 또는 다른 클라우드 도메인 | 이 도구는 공개 Azure의 공식 OpenAI/Foundry 호스트만 허용 |
 | effort 설정 오류 | `minimal`을 제거하고 지원 표의 값을 사용 |
 | 일부 지역에서 모델 배포 불가 | Azure 모델 지역 가용성과 구독 quota 확인 |
 | `finish_reason=length` 또는 빈 응답 | `MAX_OUTPUT_TOKENS`를 늘리거나 프롬프트의 응답 길이를 축소 |
