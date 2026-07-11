@@ -86,6 +86,15 @@ MODEL_DEFINITIONS: dict[str, ModelDefinition] = {
     "GPT_54_NANO_DEPLOYMENT_NAME": ModelDefinition(
         "gpt-5.4-nano", ("xhigh", "high", "medium", "low", "none")
     ),
+    "GPT_56_SOL_DEPLOYMENT_NAME": ModelDefinition(
+        "gpt-5.6-sol", ("xhigh", "high", "medium", "low", "none")
+    ),
+    "GPT_56_TERRA_DEPLOYMENT_NAME": ModelDefinition(
+        "gpt-5.6-terra", ("xhigh", "high", "medium", "low", "none")
+    ),
+    "GPT_56_LUNA_DEPLOYMENT_NAME": ModelDefinition(
+        "gpt-5.6-luna", ("xhigh", "high", "medium", "low", "none")
+    ),
 }
 
 TEST_PROMPTS = (
