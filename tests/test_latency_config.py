@@ -11,6 +11,7 @@ from test_latency import (
     build_completion_params,
     build_model_configs,
     get_completion_error,
+    get_positive_float,
     get_reasoning_efforts,
     load_configuration_environment,
     normalize_azure_openai_base_url,
@@ -35,6 +36,14 @@ class EndpointNormalizationTests(unittest.TestCase):
             "https://example.services.ai.azure.com/openai/v1/",
         )
 
+    def test_foundry_resource_endpoint(self):
+        self.assertEqual(
+            normalize_azure_openai_base_url(
+                "https://example.services.ai.azure.com/"
+            ),
+            "https://example.services.ai.azure.com/openai/v1/",
+        )
+
     def test_complete_v1_endpoint(self):
         self.assertEqual(
             normalize_azure_openai_base_url(
@@ -43,10 +52,65 @@ class EndpointNormalizationTests(unittest.TestCase):
             "https://example.services.ai.azure.com/openai/v1/",
         )
 
+    def test_explicit_https_port_is_normalized(self):
+        self.assertEqual(
+            normalize_azure_openai_base_url(
+                "https://example.openai.azure.com:443/"
+            ),
+            "https://example.openai.azure.com/openai/v1/",
+        )
+
     def test_rejects_dated_api_path(self):
         with self.assertRaisesRegex(ValueError, "resource endpoint"):
             normalize_azure_openai_base_url(
                 "https://example.openai.azure.com/openai/deployments/demo"
+            )
+
+    def test_rejects_non_azure_host(self):
+        with self.assertRaisesRegex(ValueError, "host must match"):
+            normalize_azure_openai_base_url("https://example.com")
+
+    def test_rejects_malformed_resource_name(self):
+        for hostname in (
+            " example.openai.azure.com",
+            "example .openai.azure.com",
+            "_example.openai.azure.com",
+            "-example.openai.azure.com",
+            "example-.openai.azure.com",
+            "example..openai.azure.com",
+        ):
+            with self.subTest(hostname=hostname):
+                with self.assertRaisesRegex(ValueError, "resource name"):
+                    normalize_azure_openai_base_url(f"https://{hostname}")
+
+    def test_rejects_embedded_credentials(self):
+        with self.assertRaisesRegex(ValueError, "must not contain credentials"):
+            normalize_azure_openai_base_url(
+                "https://user:password@example.openai.azure.com"
+            )
+
+    def test_rejects_non_https_port(self):
+        with self.assertRaisesRegex(ValueError, "port 443"):
+            normalize_azure_openai_base_url(
+                "https://example.openai.azure.com:8443"
+            )
+
+    def test_rejects_invalid_port(self):
+        with self.assertRaisesRegex(ValueError, "invalid port"):
+            normalize_azure_openai_base_url(
+                "https://example.openai.azure.com:not-a-port"
+            )
+
+    def test_rejects_malformed_foundry_project_path(self):
+        with self.assertRaisesRegex(ValueError, "Foundry project endpoint"):
+            normalize_azure_openai_base_url(
+                "https://example.services.ai.azure.com/api/projects/demo/extra"
+            )
+
+    def test_rejects_project_path_on_openai_resource_host(self):
+        with self.assertRaisesRegex(ValueError, "Foundry project endpoint"):
+            normalize_azure_openai_base_url(
+                "https://example.openai.azure.com/api/projects/demo"
             )
 
 
@@ -131,6 +195,17 @@ class ModelConfigurationTests(unittest.TestCase):
                 }
             )
 
+    def test_equivalent_alias_values_ignore_surrounding_whitespace(self):
+        self.assertEqual(
+            build_model_configs(
+                {
+                    "GPT_4O_DEPLOYMENT_NAME": " deployment-4o ",
+                    "GPT_4o_DEPLOYMENT_NAME": "deployment-4o",
+                }
+            ),
+            [TestConfiguration("gpt-4o", "deployment-4o")],
+        )
+
     def test_unknown_model_variable_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "GPT_55_DEPLOYMENT_NAME"):
             build_model_configs(
@@ -198,6 +273,20 @@ class RequestParameterTests(unittest.TestCase):
         self.assertEqual(params["max_completion_tokens"], 128)
         self.assertEqual(params["reasoning_effort"], "xhigh")
         self.assertNotIn("max_tokens", params)
+
+
+class NumericConfigurationTests(unittest.TestCase):
+    def test_positive_finite_float_is_accepted(self):
+        self.assertEqual(
+            get_positive_float({"TIMEOUT": "1.5"}, "TIMEOUT", 10.0),
+            1.5,
+        )
+
+    def test_non_finite_float_is_rejected(self):
+        for value in ("nan", "inf", "-inf"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "finite number"):
+                    get_positive_float({"TIMEOUT": value}, "TIMEOUT", 10.0)
 
 
 class CompletionValidationTests(unittest.TestCase):
