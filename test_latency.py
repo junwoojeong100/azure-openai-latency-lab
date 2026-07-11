@@ -1,470 +1,701 @@
-"""
-Azure OpenAI GPT Models Latency Comparison Test
-Tests GPT-4.1 and GPT-5.4 with reasoning effort
-Uses Azure OpenAI SDK with chat.completions.create()
-"""
+"""Compare Azure OpenAI chat-completion latency across configured deployments."""
 
+from __future__ import annotations
+
+import argparse
+import csv
 import os
-import re
 import time
-from typing import Dict, List
-from datetime import datetime
-from openai import AzureOpenAI
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from statistics import fmean, pstdev
+from typing import Any, Mapping, Sequence
+from urllib.parse import urlsplit
+
+from azure.core.exceptions import AzureError
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
-from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv()
+from dotenv import dotenv_values
+from openai import OpenAI, OpenAIError
 
 
-# Deployments whose names match this pattern support the reasoning_effort parameter
-# (GPT-5 series and newer: gpt-5, gpt-5.1, gpt-5.2, gpt-5.4, gpt-5.4-mini, ...).
-REASONING_MODEL_PATTERN = re.compile(r"gpt-5", re.IGNORECASE)
+EFFORT_ORDER = ("xhigh", "high", "medium", "low", "none")
+DEFAULT_TOKEN_SCOPE = "https://ai.azure.com/.default"
+DEFAULT_MAX_OUTPUT_TOKENS = 4096
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 120.0
+DEFAULT_MAX_RETRIES = 0
 
-# Reasoning effort levels to sweep for each 5.x model.
-# Valid values for the GPT-5.x series: none, minimal, low, medium, high.
-# Ordered from highest reasoning intensity to lowest so the heaviest runs execute first.
-DEFAULT_REASONING_EFFORTS = ["high", "medium", "low", "minimal", "none"]
-
-# Relative reasoning intensity used to order efforts (higher = more reasoning).
-REASONING_EFFORT_INTENSITY = {"none": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4}
-
-
-def is_reasoning_model(deployment_name: str) -> bool:
-    """Return True if a deployment supports the reasoning_effort parameter."""
-    return bool(deployment_name) and bool(REASONING_MODEL_PATTERN.search(deployment_name))
-
-
-def get_reasoning_efforts(env: Dict[str, str] = None) -> List[str]:
-    """Reasoning effort levels to test, from REASONING_EFFORTS (comma-separated) or defaults.
-
-    The list is always ordered from highest reasoning intensity to lowest
-    (high -> medium -> low -> minimal -> none) so the heaviest configurations run first.
-    Unknown effort names are placed last.
-    """
-    env = env if env is not None else os.environ
-    raw = env.get("REASONING_EFFORTS", ",".join(DEFAULT_REASONING_EFFORTS))
-    efforts = [e.strip() for e in raw.split(",") if e.strip()]
-    efforts = efforts or list(DEFAULT_REASONING_EFFORTS)
-    return sorted(efforts, key=lambda e: REASONING_EFFORT_INTENSITY.get(e.lower(), -1), reverse=True)
+CSV_FIELDS = (
+    "model",
+    "deployment",
+    "prompt",
+    "reasoning_effort",
+    "latency_ms",
+    "tokens",
+    "completion_tokens",
+    "prompt_tokens",
+    "reasoning_tokens",
+    "response",
+    "finish_reason",
+    "success",
+    "error",
+    "iteration",
+    "timestamp",
+)
 
 
-def build_model_configs(env: Dict[str, str] = None, efforts: List[str] = None) -> Dict[str, object]:
-    """Build a {label: deployment} map from every GPT_*_DEPLOYMENT_NAME entry in the env.
+@dataclass(frozen=True)
+class ModelDefinition:
+    model_id: str
+    supported_efforts: tuple[str, ...] = ()
 
-    Non-reasoning models (e.g. gpt-4.1) map to a plain deployment name. Each 5.x reasoning
-    model is expanded into one entry per reasoning effort level so latency can be measured
-    across all settable efforts, e.g. ``gpt-5.4 (high)`` -> ("gpt-5.4", "high").
-    """
-    env = env if env is not None else os.environ
-    efforts = efforts if efforts is not None else get_reasoning_efforts(env)
 
-    configs: Dict[str, object] = {}
-    seen = set()
-    for key in sorted(env.keys()):
-        if not (key.startswith("GPT_") and key.endswith("_DEPLOYMENT_NAME")):
+@dataclass(frozen=True)
+class TestConfiguration:
+    model_id: str
+    deployment_name: str
+    reasoning_effort: str | None = None
+
+    @property
+    def label(self) -> str:
+        model_label = self.model_id
+        if self.deployment_name != self.model_id:
+            model_label = f"{self.model_id} [{self.deployment_name}]"
+        if self.reasoning_effort is not None:
+            return f"{model_label} ({self.reasoning_effort})"
+        return model_label
+
+
+# Deployment names in Azure are user-defined, so capabilities must come from the
+# environment-variable key rather than from the deployment-name value.
+MODEL_DEFINITIONS: dict[str, ModelDefinition] = {
+    "GPT_41_DEPLOYMENT_NAME": ModelDefinition("gpt-4.1"),
+    "GPT_4O_DEPLOYMENT_NAME": ModelDefinition("gpt-4o"),
+    "GPT_51_DEPLOYMENT_NAME": ModelDefinition(
+        "gpt-5.1", ("high", "medium", "low", "none")
+    ),
+    "GPT_52_DEPLOYMENT_NAME": ModelDefinition(
+        "gpt-5.2", ("xhigh", "high", "medium", "low", "none")
+    ),
+    "GPT_54_DEPLOYMENT_NAME": ModelDefinition(
+        "gpt-5.4", ("xhigh", "high", "medium", "low", "none")
+    ),
+    "GPT_54_MINI_DEPLOYMENT_NAME": ModelDefinition(
+        "gpt-5.4-mini", ("xhigh", "high", "medium", "low", "none")
+    ),
+    "GPT_54_NANO_DEPLOYMENT_NAME": ModelDefinition(
+        "gpt-5.4-nano", ("xhigh", "high", "medium", "low", "none")
+    ),
+}
+
+TEST_PROMPTS = (
+    "프랑스의 수도는 어디인가요?",
+    "양자 컴퓨팅을 비전공자에게 5문장 이내로 설명해주세요.",
+    "팩토리얼을 계산하는 파이썬 함수와 핵심 설명을 간결하게 작성해주세요.",
+)
+
+
+def normalize_azure_openai_base_url(endpoint: str) -> str:
+    """Convert a resource or Foundry project endpoint to an Azure OpenAI v1 URL."""
+    value = endpoint.strip()
+    if not value:
+        raise ValueError("Azure OpenAI endpoint is empty.")
+
+    parsed = urlsplit(value)
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise ValueError("Azure OpenAI endpoint must be an absolute HTTPS URL.")
+    if parsed.query or parsed.fragment:
+        raise ValueError("Azure OpenAI endpoint must not contain a query or fragment.")
+
+    path = parsed.path.rstrip("/")
+    if path.startswith("/api/projects/"):
+        path = ""
+    elif path not in ("", "/openai/v1"):
+        raise ValueError(
+            "Azure OpenAI endpoint must be a resource endpoint, a Foundry project "
+            "endpoint, or a URL ending in /openai/v1/."
+        )
+
+    return f"{parsed.scheme}://{parsed.netloc}/openai/v1/"
+
+
+def get_endpoint(env: Mapping[str, str]) -> tuple[str, str]:
+    """Return the configured endpoint and the environment variable that supplied it."""
+    for key in ("AZURE_OPENAI_ENDPOINT", "AZURE_AI_PROJECT_ENDPOINT"):
+        value = (env.get(key) or "").strip()
+        if value:
+            return value, key
+    raise ValueError(
+        "Set AZURE_OPENAI_ENDPOINT or AZURE_AI_PROJECT_ENDPOINT in your .env file."
+    )
+
+
+def get_reasoning_efforts(env: Mapping[str, str] | None = None) -> list[str]:
+    """Return requested effort levels in deterministic high-to-low order."""
+    source = os.environ if env is None else env
+    raw = (source.get("REASONING_EFFORTS") or "").strip()
+    if not raw:
+        return list(EFFORT_ORDER)
+
+    requested = {value.strip().lower() for value in raw.split(",") if value.strip()}
+    if not requested:
+        raise ValueError("REASONING_EFFORTS must contain at least one value.")
+
+    unsupported = sorted(requested.difference(EFFORT_ORDER))
+    if unsupported:
+        valid = ", ".join(EFFORT_ORDER)
+        raise ValueError(
+            f"Unsupported REASONING_EFFORTS value(s): {', '.join(unsupported)}. "
+            f"Valid values for this guide are: {valid}."
+        )
+
+    return [effort for effort in EFFORT_ORDER if effort in requested]
+
+
+def normalize_model_environment(env: Mapping[str, str]) -> dict[str, str]:
+    """Normalize model variable names case-insensitively and reject duplicates."""
+    normalized: dict[str, str] = {}
+    original_keys: dict[str, str] = {}
+    for key, value in env.items():
+        normalized_key = key.upper()
+        if not (
+            normalized_key.startswith("GPT_")
+            and normalized_key.endswith("_DEPLOYMENT_NAME")
+        ):
             continue
-        deployment = (env.get(key) or "").strip()
-        if not deployment or deployment in seen:
+
+        previous_value = normalized.get(normalized_key)
+        if (
+            previous_value is not None
+            and previous_value.strip()
+            and value.strip()
+            and previous_value != value
+        ):
+            raise ValueError(
+                f"Conflicting values for {original_keys[normalized_key]} and {key}."
+            )
+        if previous_value is None or value.strip():
+            normalized[normalized_key] = value
+            original_keys[normalized_key] = key
+    return normalized
+
+
+def load_configuration_environment(
+    dotenv_path: str | Path = ".env",
+    process_env: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Load .env settings, then apply process-environment overrides."""
+    file_environment = {
+        key: value
+        for key, value in dotenv_values(dotenv_path).items()
+        if value is not None
+    }
+    runtime_environment = dict(os.environ if process_env is None else process_env)
+
+    file_models = normalize_model_environment(file_environment)
+    runtime_models = normalize_model_environment(runtime_environment)
+
+    combined = dict(file_environment)
+    combined.update(runtime_environment)
+    for key in list(combined):
+        normalized_key = key.upper()
+        if (
+            normalized_key.startswith("GPT_")
+            and normalized_key.endswith("_DEPLOYMENT_NAME")
+        ):
+            del combined[key]
+    combined.update(file_models)
+    combined.update(runtime_models)
+    return combined
+
+
+def build_model_configs(
+    env: Mapping[str, str] | None = None,
+    efforts: Sequence[str] | None = None,
+) -> list[TestConfiguration]:
+    """Expand configured deployments into valid model and effort combinations."""
+    source = os.environ if env is None else env
+    model_environment = normalize_model_environment(source)
+    requested_efforts = list(efforts) if efforts is not None else get_reasoning_efforts(source)
+
+    unknown_keys = sorted(
+        key
+        for key, value in model_environment.items()
+        if (value or "").strip() and key not in MODEL_DEFINITIONS
+    )
+    if unknown_keys:
+        raise ValueError(
+            "Unsupported deployment environment variable(s): "
+            f"{', '.join(unknown_keys)}. Add the model to MODEL_DEFINITIONS before use."
+        )
+
+    configurations: list[TestConfiguration] = []
+    deployment_owners: dict[str, str] = {}
+
+    for env_key, definition in MODEL_DEFINITIONS.items():
+        deployment_name = (model_environment.get(env_key) or "").strip()
+        if not deployment_name:
             continue
-        seen.add(deployment)
 
-        if is_reasoning_model(deployment):
-            for effort in efforts:
-                configs[f"{deployment} ({effort})"] = (deployment, effort)
-        else:
-            configs[deployment] = deployment
-    return configs
+        previous_model = deployment_owners.get(deployment_name)
+        if previous_model is not None:
+            raise ValueError(
+                f"Deployment '{deployment_name}' is configured for both "
+                f"{previous_model} and {definition.model_id}."
+            )
+        deployment_owners[deployment_name] = definition.model_id
 
+        if not definition.supported_efforts:
+            configurations.append(
+                TestConfiguration(definition.model_id, deployment_name)
+            )
+            continue
+
+        model_efforts = [
+            effort
+            for effort in requested_efforts
+            if effort in definition.supported_efforts
+        ]
+        if not model_efforts:
+            supported = ", ".join(definition.supported_efforts)
+            raise ValueError(
+                f"No requested reasoning effort is supported by {definition.model_id}. "
+                f"Supported values: {supported}."
+            )
+
+        configurations.extend(
+            TestConfiguration(definition.model_id, deployment_name, effort)
+            for effort in model_efforts
+        )
+
+    if not configurations:
+        expected = ", ".join(MODEL_DEFINITIONS)
+        raise ValueError(
+            "No model deployments found. Set at least one supported deployment "
+            f"variable in .env: {expected}."
+        )
+
+    return configurations
+
+
+def get_positive_int(
+    env: Mapping[str, str], key: str, default: int, *, minimum: int = 1
+) -> int:
+    raw = (env.get(key) or str(default)).strip()
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ValueError(f"{key} must be an integer.") from error
+    if value < minimum:
+        raise ValueError(f"{key} must be at least {minimum}.")
+    return value
+
+
+def get_positive_float(
+    env: Mapping[str, str], key: str, default: float
+) -> float:
+    raw = (env.get(key) or str(default)).strip()
+    try:
+        value = float(raw)
+    except ValueError as error:
+        raise ValueError(f"{key} must be a number.") from error
+    if value <= 0:
+        raise ValueError(f"{key} must be greater than 0.")
+    return value
+
+
+def build_completion_params(
+    configuration: TestConfiguration, prompt: str, max_output_tokens: int
+) -> dict[str, Any]:
+    """Build parameters accepted by the selected Chat Completions model."""
+    params: dict[str, Any] = {
+        "model": configuration.deployment_name,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if configuration.reasoning_effort is None:
+        params["max_tokens"] = max_output_tokens
+    else:
+        params["reasoning_effort"] = configuration.reasoning_effort
+        params["max_completion_tokens"] = max_output_tokens
+    return params
+
+
+def get_completion_error(finish_reason: str | None, content: str) -> str | None:
+    """Return an actionable error when a text completion is incomplete."""
+    if finish_reason == "length":
+        return (
+            "Incomplete response (finish_reason='length'). "
+            "Increase MAX_OUTPUT_TOKENS or shorten the prompt."
+        )
+    if finish_reason == "content_filter":
+        return "The response was blocked by the Azure OpenAI content filter."
+    if finish_reason != "stop":
+        return f"Incomplete response (finish_reason={finish_reason!r})."
+    if not content.strip():
+        return "The model returned an empty response."
+    return None
 
 
 class LatencyTester:
-    def __init__(self):
-        # Azure OpenAI 클라이언트 생성 (모든 모델 공용)
-        endpoint = os.getenv("AZURE_AI_PROJECT_ENDPOINT")
-        
-        if not endpoint:
-            raise ValueError("AZURE_AI_PROJECT_ENDPOINT is required")
-        
-        # Extract base endpoint (remove /api/projects/... part)
-        if "/api/projects/" in endpoint:
-            base_endpoint = endpoint.split("/api/projects/")[0]
-        else:
-            base_endpoint = endpoint
-            
-        print(f"Using Azure OpenAI SDK with DefaultAzureCredential")
-        print(f"Endpoint: {base_endpoint}")
-        
-        # DefaultAzureCredential 기반 토큰 인증 (az login 필요)
+    def __init__(
+        self,
+        env: Mapping[str, str] | None = None,
+        *,
+        prompts: Sequence[str] = TEST_PROMPTS,
+    ) -> None:
+        self.env = dict(os.environ if env is None else env)
+        endpoint, endpoint_source = get_endpoint(self.env)
+        self.base_url = normalize_azure_openai_base_url(endpoint)
+        self.reasoning_efforts = get_reasoning_efforts(self.env)
+        self.configurations = build_model_configs(
+            self.env, efforts=self.reasoning_efforts
+        )
+        self.prompts = tuple(prompts)
+        if not self.prompts:
+            raise ValueError("At least one test prompt is required.")
+
+        self.max_output_tokens = get_positive_int(
+            self.env, "MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS
+        )
+        timeout = get_positive_float(
+            self.env,
+            "REQUEST_TIMEOUT_SECONDS",
+            DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        )
+        max_retries = get_positive_int(
+            self.env, "MAX_RETRIES", DEFAULT_MAX_RETRIES, minimum=0
+        )
+        token_scope = (
+            self.env.get("AZURE_OPENAI_TOKEN_SCOPE") or DEFAULT_TOKEN_SCOPE
+        ).strip()
+        if not token_scope.endswith("/.default"):
+            raise ValueError("AZURE_OPENAI_TOKEN_SCOPE must end with '/.default'.")
+
         credential = DefaultAzureCredential()
-        token_provider = get_bearer_token_provider(
-            credential, "https://cognitiveservices.azure.com/.default"
-        )
-        
-        # Create a single Azure OpenAI client for all models
-        self.client = AzureOpenAI(
-            azure_ad_token_provider=token_provider,
-            api_version="2024-08-01-preview",
-            azure_endpoint=base_endpoint
-        )
-        
-        print(f"API Version: 2024-08-01-preview\n")
+        client_created = False
+        try:
+            token_provider = get_bearer_token_provider(credential, token_scope)
+            client = OpenAI(
+                base_url=self.base_url,
+                api_key=token_provider,
+                timeout=timeout,
+                max_retries=max_retries,
+            )
+            client_created = True
+        finally:
+            if not client_created:
+                credential.close()
+        self.credential = credential
+        self.client = client
 
-        # Reasoning effort levels to sweep for each 5.x model (configurable via REASONING_EFFORTS)
-        self.reasoning_efforts = get_reasoning_efforts()
+        print("Azure OpenAI latency comparison")
+        print(f"  Endpoint source: {endpoint_source}")
+        print("  API:             /openai/v1/ (no dated api-version)")
+        print(f"  Token scope:     {token_scope}")
+        print(f"  Output limit:    {self.max_output_tokens} tokens")
+        print(f"  Configurations:  {len(self.configurations)}")
+        for configuration in self.configurations:
+            print(f"    - {configuration.label}")
 
-        # Model configurations built dynamically from every GPT_*_DEPLOYMENT_NAME in .env:
-        #   - Non-reasoning models (e.g. gpt-4.1) are tested as-is.
-        #   - Each 5.x model is expanded into one entry per reasoning effort level.
-        self.models = build_model_configs(efforts=self.reasoning_efforts)
+    def close(self) -> None:
+        try:
+            self.client.close()
+        finally:
+            self.credential.close()
 
-        if not self.models:
-            raise ValueError(
-                "No model deployments found. Set GPT_*_DEPLOYMENT_NAME entries in your .env file."
+    def warmup_clients(self) -> None:
+        """Warm each deployment once and fail before the measured run on an error."""
+        print(f"\n{'=' * 80}")
+        print("Warming up deployments")
+        print(f"{'=' * 80}")
+
+        by_deployment: dict[str, list[TestConfiguration]] = {}
+        for configuration in self.configurations:
+            by_deployment.setdefault(configuration.deployment_name, []).append(
+                configuration
             )
 
-        reasoning_models = sorted({
-            info[0] for info in self.models.values() if isinstance(info, tuple)
-        })
-        plain_models = sorted({
-            info for info in self.models.values() if not isinstance(info, tuple)
-        })
+        failures: list[str] = []
+        for deployment_name, configurations in by_deployment.items():
+            warmup_configuration = next(
+                (
+                    configuration
+                    for configuration in configurations
+                    if configuration.reasoning_effort == "none"
+                ),
+                configurations[-1],
+            )
+            params = build_completion_params(
+                warmup_configuration,
+                "Reply with OK.",
+                min(self.max_output_tokens, 32),
+            )
+            print(f"Warming up {warmup_configuration.label}...", end=" ", flush=True)
+            started = time.perf_counter()
+            try:
+                self.client.chat.completions.create(**params)
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                print(f"{elapsed_ms:.0f}ms")
+            except (OpenAIError, AzureError) as error:
+                print("failed")
+                failures.append(f"{deployment_name}: {error}")
 
-        print("Model configurations:")
-        if reasoning_models:
-            print(f"  Reasoning (5.x) models: {', '.join(reasoning_models)}")
-            print(f"  Reasoning efforts swept: {', '.join(self.reasoning_efforts)}")
-        if plain_models:
-            print(f"  Standard models:        {', '.join(plain_models)}")
-        print(f"  Total test configurations: {len(self.models)}\n")
+        if failures:
+            details = "\n".join(f"  - {failure}" for failure in failures)
+            raise RuntimeError(f"Warmup failed:\n{details}")
 
-        
-        # Test prompts - varied complexity (5 prompts for comprehensive testing)
-        self.test_prompts = [
-            "프랑스의 수도는 어디인가요?",
-            "양자 컴퓨팅을 쉽게 설명해주세요.",
-            "팩토리얼을 계산하는 파이썬 함수를 작성해주세요."
-        ]
-    
-    def test_model_latency(self, model_name: str, deployment_info, prompt: str) -> Dict:
-        """Test latency for a single model with a single prompt"""
-        # deployment_info가 튜플이면 (deployment_name, reasoning_effort) 형태
-        if isinstance(deployment_info, tuple):
-            deployment_name, reasoning_effort = deployment_info
-        else:
-            deployment_name = deployment_info
-            reasoning_effort = None
-
+    def test_model_latency(
+        self, configuration: TestConfiguration, prompt: str
+    ) -> dict[str, Any]:
+        """Measure one non-streaming request from send to complete response."""
+        started = time.perf_counter()
         try:
-            start_time = time.time()
-            
-            client = self.client
-            
-            # Prepare chat completion parameters
-            messages = [
-                {
-                    "role": "user", 
-                    "content": prompt
-                }
-            ]
-            
-            # Create chat completion with reasoning_effort parameter
-            params = {
-                "model": deployment_name,
-                "messages": messages
-            }
-            
-            # Add reasoning_effort parameter for GPT-5/5.x models
-            if reasoning_effort is not None:
-                params["reasoning_effort"] = reasoning_effort
-            
-            # Create chat completion - no fallback, let errors surface
-            response = client.chat.completions.create(**params)
-            
-            end_time = time.time()
-            latency = (end_time - start_time) * 1000  # Convert to milliseconds
-            
-            # Extract response
-            response_content = response.choices[0].message.content if response.choices else ""
-            
-            # Reasoning tokens are nested under completion_tokens_details for reasoning models
-            reasoning_tokens = None
-            if response.usage is not None:
-                details = getattr(response.usage, "completion_tokens_details", None)
-                if details is not None:
-                    reasoning_tokens = getattr(details, "reasoning_tokens", None)
-            
+            response = self.client.chat.completions.create(
+                **build_completion_params(
+                    configuration, prompt, self.max_output_tokens
+                )
+            )
+            latency_ms = (time.perf_counter() - started) * 1000
+        except (OpenAIError, AzureError) as error:
             return {
-                "model": model_name,
+                "model": configuration.model_id,
+                "deployment": configuration.deployment_name,
                 "prompt": prompt,
-                "reasoning_effort": reasoning_effort,
-                "latency_ms": round(latency, 2),
-                "tokens": response.usage.total_tokens if response.usage else None,
-                "completion_tokens": response.usage.completion_tokens if response.usage else None,
-                "prompt_tokens": response.usage.prompt_tokens if response.usage else None,
-                "reasoning_tokens": reasoning_tokens,
-                "response": response_content[:100],
-                "success": True,
-                "error": None
-            }
-            
-        except Exception as e:
-            return {
-                "model": model_name,
-                "prompt": prompt,
-                "reasoning_effort": reasoning_effort,
+                "reasoning_effort": configuration.reasoning_effort,
                 "latency_ms": None,
                 "tokens": None,
                 "completion_tokens": None,
                 "prompt_tokens": None,
                 "reasoning_tokens": None,
                 "response": None,
+                "finish_reason": None,
                 "success": False,
-                "error": str(e)
+                "error": str(error),
             }
-    
-    def warmup_clients(self):
-        """Warm up API clients by making dummy calls to establish connections"""
-        print(f"\n{'='*80}")
-        print("Warming up API connections...")
-        print(f"{'='*80}\n")
-        
-        warmup_prompt = "Hi"
-        warmup_models = set()
-        
-        # Collect unique deployment names to warm up
-        for deployment_info in self.models.values():
-            if isinstance(deployment_info, tuple):
-                deployment_name = deployment_info[0]
-            else:
-                deployment_name = deployment_info
-            warmup_models.add(deployment_name)
-        
-        for deployment_name in warmup_models:
-            try:
-                client = self.client
-                
-                print(f"Warming up {deployment_name}...", end=" ")
-                start = time.time()
-                
-                # GPT-5 and GPT-5.1 models use max_completion_tokens instead of max_tokens
-                # Increase token limit to avoid truncation errors
-                if "gpt-5" in deployment_name.lower():
-                    response = client.chat.completions.create(
-                        model=deployment_name,
-                        messages=[{"role": "user", "content": warmup_prompt}],
-                        max_completion_tokens=50
-                    )
-                else:
-                    response = client.chat.completions.create(
-                        model=deployment_name,
-                        messages=[{"role": "user", "content": warmup_prompt}],
-                        max_tokens=50
-                    )
-                
-                elapsed = (time.time() - start) * 1000
-                print(f"{elapsed:.0f}ms")
-                
-            except Exception as e:
-                print(f"Failed: {e}")
-        
-        print(f"\nWarmup complete!\n")
-    
-    def run_tests(self, iterations: int = 1) -> List[Dict]:
-        """Run latency tests for all models"""
-        results = []
 
-        print(f"\n{'='*80}")
-        print(f"Azure OpenAI Latency Comparison Test")
-        print(f"Testing {len(self.models)} model configurations")
-        print(f"Iterations per prompt: {iterations}")
-        print(f"{'='*80}\n")
+        usage = response.usage
+        reasoning_tokens = None
+        if usage is not None:
+            details = getattr(usage, "completion_tokens_details", None)
+            if details is not None:
+                reasoning_tokens = getattr(details, "reasoning_tokens", None)
 
-        for model_name, deployment_info in self.models.items():
-            effort = deployment_info[1] if isinstance(deployment_info, tuple) else None
-            header = f"Testing: {model_name}"
-            if effort is not None:
-                header += f"  (reasoning_effort={effort})"
-            print(f"\n{'='*80}")
-            print(header)
-            print(f"{'='*80}")
-            
-            for i, prompt in enumerate(self.test_prompts, 1):
-                print(f"\n📝 Prompt {i}/{len(self.test_prompts)}: {prompt}")
-                
-                for iteration in range(iterations):
-                    result = self.test_model_latency(model_name, deployment_info, prompt)
-                    result["iteration"] = iteration + 1
-                    result["timestamp"] = datetime.now().isoformat()
+        choice = response.choices[0] if response.choices else None
+        content = choice.message.content or "" if choice is not None else ""
+        finish_reason = choice.finish_reason if choice is not None else None
+        response_preview = " ".join(content.split())[:200]
+        completion_error = get_completion_error(finish_reason, content)
+
+        return {
+            "model": configuration.model_id,
+            "deployment": configuration.deployment_name,
+            "prompt": prompt,
+            "reasoning_effort": configuration.reasoning_effort,
+            "latency_ms": round(latency_ms, 2),
+            "tokens": usage.total_tokens if usage is not None else None,
+            "completion_tokens": (
+                usage.completion_tokens if usage is not None else None
+            ),
+            "prompt_tokens": usage.prompt_tokens if usage is not None else None,
+            "reasoning_tokens": reasoning_tokens,
+            "response": response_preview,
+            "finish_reason": finish_reason,
+            "success": completion_error is None,
+            "error": completion_error,
+        }
+
+    def run_tests(self, iterations: int = 1) -> list[dict[str, Any]]:
+        """Run every configured model/effort and prompt combination."""
+        results: list[dict[str, Any]] = []
+
+        print(f"\n{'=' * 80}")
+        print("Measured run")
+        print(f"  Configurations: {len(self.configurations)}")
+        print(f"  Prompts:        {len(self.prompts)}")
+        print(f"  Iterations:     {iterations}")
+        print(f"{'=' * 80}")
+
+        for configuration in self.configurations:
+            print(f"\nTesting {configuration.label}")
+            for prompt_index, prompt in enumerate(self.prompts, 1):
+                print(f"  Prompt {prompt_index}/{len(self.prompts)}: {prompt}")
+                for iteration in range(1, iterations + 1):
+                    result = self.test_model_latency(configuration, prompt)
+                    result["iteration"] = iteration
+                    result["timestamp"] = datetime.now(timezone.utc).isoformat()
                     results.append(result)
-                    
+
                     if result["success"]:
-                        print(f"\n💬 Response: {result['response']}")
-                        print(f"⏱️  Latency: {result['latency_ms']:.0f}ms")
-                        reasoning_str = ""
-                        if result.get("reasoning_tokens") is not None:
-                            reasoning_str = f", Reasoning: {result['reasoning_tokens']}"
-                        print(f"🔢 Tokens - Total: {result['tokens']}, Prompt: {result['prompt_tokens']}, Completion: {result['completion_tokens']}{reasoning_str}")
+                        reasoning = ""
+                        if result["reasoning_tokens"] is not None:
+                            reasoning = (
+                                f", reasoning={result['reasoning_tokens']}"
+                            )
+                        print(
+                            f"    iteration {iteration}: "
+                            f"{result['latency_ms']:.0f}ms, "
+                            f"tokens={result['tokens']}{reasoning}"
+                        )
                     else:
-                        print(f"\n❌ Failed: {result.get('error', 'Unknown error')}")
-                    
+                        print(
+                            f"    iteration {iteration}: failed: {result['error']}"
+                        )
+
                     time.sleep(0.2)
 
         return results
-    
-    def analyze_results(self, results: List[Dict]):
-        """Analyze and display results with comprehensive statistics"""
-        print(f"\n{'='*80}")
-        print("DETAILED RESULTS - PROMPTS AND RESPONSES")
-        print(f"{'='*80}\n")
-        
-        # Display all prompts and responses with token usage
-        for i, result in enumerate(results, 1):
-            if result["success"]:
-                print(f"Test {i}: {result['model']}")
-                print(f"Prompt: {result['prompt']}")
-                print(f"Response: {result['response']}")
-                print(f"Latency: {result['latency_ms']:.0f}ms")
-                reasoning_str = ""
-                if result.get("reasoning_tokens") is not None:
-                    reasoning_str = f", Reasoning: {result['reasoning_tokens']}"
-                print(f"Tokens - Total: {result['tokens']}, Prompt: {result['prompt_tokens']}, Completion: {result['completion_tokens']}{reasoning_str}")
-                print("-" * 80)
-        
-        print(f"\n{'='*80}")
-        print("LATENCY ANALYSIS")
-        print(f"{'='*80}\n")
-        
-        # Group by model and prompt
-        model_stats = {}
-        model_prompt_stats = {}
-        model_token_stats = {}
-        
+
+    def analyze_results(self, results: Sequence[Mapping[str, Any]]) -> None:
+        """Print latency and token summaries for successful requests."""
+        print(f"\n{'=' * 80}")
+        print("Results")
+        print(f"{'=' * 80}")
+
+        grouped: dict[str, list[Mapping[str, Any]]] = {}
         for result in results:
             if result["success"]:
-                model = result["model"]
-                prompt = result["prompt"]
-                
-                if model not in model_stats:
-                    model_stats[model] = {"latencies": []}
-                    model_prompt_stats[model] = {}
-                    model_token_stats[model] = {"total": [], "prompt": [], "completion": [], "reasoning": []}
-                
-                model_stats[model]["latencies"].append(result["latency_ms"])
-                model_token_stats[model]["total"].append(result["tokens"])
-                model_token_stats[model]["prompt"].append(result["prompt_tokens"])
-                model_token_stats[model]["completion"].append(result["completion_tokens"])
-                if result.get("reasoning_tokens") is not None:
-                    model_token_stats[model]["reasoning"].append(result["reasoning_tokens"])
-                
-                if prompt not in model_prompt_stats[model]:
-                    model_prompt_stats[model][prompt] = []
-                model_prompt_stats[model][prompt].append(result["latency_ms"])
-        
-        # Display detailed per-prompt latencies
-        print("DETAILED LATENCY BY PROMPT")
-        print("-" * 120)
-        
-        sorted_models = sorted(model_stats.items(), key=lambda x: sum(x[1]["latencies"])/len(x[1]["latencies"]))
-        
-        for model, stats in sorted_models:
-            print(f"\n{model}:")
-            for i, prompt in enumerate(self.test_prompts, 1):
-                if prompt in model_prompt_stats[model]:
-                    latencies = model_prompt_stats[model][prompt]
-                    avg = sum(latencies) / len(latencies)
-                    print(f"  Prompt {i}: {avg:.0f}ms (iterations: {latencies})")
-        
-        # Calculate overall statistics
-        print(f"\n{'='*80}")
-        print("OVERALL STATISTICS")
-        print(f"{'='*80}\n")
-        print(f"{'Model':<30} {'Avg (ms)':<12} {'Min (ms)':<12} {'Max (ms)':<12} {'Std Dev':<12} {'Avg Tokens':<12} {'Avg Reason':<12} {'Tests':<8}")
-        print("-" * 122)
-        
-        for model, stats in sorted_models:
-            latencies = stats["latencies"]
-            avg_latency = sum(latencies) / len(latencies)
-            min_latency = min(latencies)
-            max_latency = max(latencies)
-            
-            # Calculate standard deviation
-            variance = sum((x - avg_latency) ** 2 for x in latencies) / len(latencies)
-            std_dev = variance ** 0.5
-            
-            # Calculate average tokens
-            avg_tokens = sum(model_token_stats[model]["total"]) / len(model_token_stats[model]["total"])
-            
-            # Calculate average reasoning tokens (reasoning models only)
-            reasoning_vals = model_token_stats[model]["reasoning"]
-            avg_reasoning = f"{sum(reasoning_vals) / len(reasoning_vals):.1f}" if reasoning_vals else "-"
-            
-            print(f"{model:<30} {avg_latency:<12.2f} {min_latency:<12.2f} {max_latency:<12.2f} {std_dev:<12.2f} {avg_tokens:<12.1f} {avg_reasoning:<12} {len(latencies):<8}")
-        
-        # Error summary
-        errors = [r for r in results if not r["success"]]
+                effort = result.get("reasoning_effort")
+                label = str(result["model"])
+                if effort is not None:
+                    label = f"{label} ({effort})"
+                grouped.setdefault(label, []).append(result)
+
+        if grouped:
+            print(
+                f"{'Model':<28} {'Avg ms':>10} {'Min ms':>10} {'Max ms':>10} "
+                f"{'Std dev':>10} {'Avg tokens':>12} {'Avg reason':>12} {'Tests':>7}"
+            )
+            print("-" * 115)
+            rows: list[tuple[float, str, list[Mapping[str, Any]]]] = []
+            for label, model_results in grouped.items():
+                latencies = [float(result["latency_ms"]) for result in model_results]
+                rows.append((fmean(latencies), label, model_results))
+
+            for average_latency, label, model_results in sorted(rows):
+                latencies = [float(result["latency_ms"]) for result in model_results]
+                token_values = [
+                    int(result["tokens"])
+                    for result in model_results
+                    if result["tokens"] is not None
+                ]
+                reasoning_values = [
+                    int(result["reasoning_tokens"])
+                    for result in model_results
+                    if result["reasoning_tokens"] is not None
+                ]
+                average_tokens = (
+                    f"{fmean(token_values):.1f}" if token_values else "-"
+                )
+                average_reasoning = (
+                    f"{fmean(reasoning_values):.1f}" if reasoning_values else "-"
+                )
+                print(
+                    f"{label:<28} {average_latency:>10.2f} "
+                    f"{min(latencies):>10.2f} {max(latencies):>10.2f} "
+                    f"{pstdev(latencies):>10.2f} {average_tokens:>12} "
+                    f"{average_reasoning:>12} {len(latencies):>7}"
+                )
+        else:
+            print("No successful requests.")
+
+        errors = [result for result in results if not result["success"]]
         if errors:
-            print(f"\n{'='*80}")
-            print(f"ERRORS ({len(errors)} total)")
-            print(f"{'='*80}\n")
-            # De-duplicate identical (model, error) pairs to keep the summary readable
-            seen_errors = set()
+            print(f"\nERRORS ({len(errors)})")
+            seen: set[tuple[Any, Any, Any]] = set()
             for error in errors:
-                key = (error['model'], error['error'])
-                if key in seen_errors:
+                key = (
+                    error["model"],
+                    error.get("reasoning_effort"),
+                    error["error"],
+                )
+                if key in seen:
                     continue
-                seen_errors.add(key)
-                effort = error.get('reasoning_effort')
-                effort_str = f" (reasoning_effort={effort})" if effort is not None else ""
-                print(f"Model: {error['model']}{effort_str}")
-                print(f"Error: {error['error']}\n")
-    
-    def save_results(self, results: List[Dict], filename: str = "latency_results.csv"):
-        """Save results to CSV file"""
-        import csv
-        
+                seen.add(key)
+                effort = error.get("reasoning_effort")
+                label = str(error["model"])
+                if effort is not None:
+                    label = f"{label} ({effort})"
+                print(f"  {label}: {error['error']}")
+
+    @staticmethod
+    def save_results(
+        results: Sequence[Mapping[str, Any]],
+        filename: str | Path = "latency_results.csv",
+    ) -> None:
+        """Save results with a stable CSV schema."""
         if not results:
-            print("No results to save.")
-            return
-        
-        keys = results[0].keys()
-        
-        with open(filename, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=keys)
+            raise ValueError("No results to save.")
+
+        output_path = Path(filename)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("w", newline="", encoding="utf-8") as output_file:
+            writer = csv.DictWriter(output_file, fieldnames=CSV_FIELDS)
             writer.writeheader()
             writer.writerows(results)
-        
-        print(f"\nResults saved to {filename}")
+        print(f"\nResults saved to {output_path}")
 
 
-def main():
-    # Check environment variables
-    endpoint = os.getenv("AZURE_AI_PROJECT_ENDPOINT")
-    
-    if not endpoint:
-        print("Error: AZURE_AI_PROJECT_ENDPOINT is required")
-        print("Set it in your .env file")
-        return
-    
-    print("Using Azure OpenAI SDK with DefaultAzureCredential...")
-    
+def positive_int_argument(value: str) -> int:
     try:
-        # Run tests
-        tester = LatencyTester()
-        
-        # Warm up connections first
-        tester.warmup_clients()
-        
-        results = tester.run_tests(iterations=1)
-        
-        # Analyze results
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be an integer") from error
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Compare Azure OpenAI deployment latency by reasoning effort."
+    )
+    parser.add_argument(
+        "--iterations",
+        type=positive_int_argument,
+        default=1,
+        help="Measured requests per prompt and configuration (default: 1).",
+    )
+    parser.add_argument(
+        "--output",
+        default="latency_results.csv",
+        help="CSV output path (default: latency_results.csv).",
+    )
+    parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help="Use only the first prompt for a shorter end-to-end check.",
+    )
+    parser.add_argument(
+        "--skip-warmup",
+        action="store_true",
+        help="Skip the unmeasured deployment warmup.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    prompts = TEST_PROMPTS[:1] if args.smoke else TEST_PROMPTS
+    tester: LatencyTester | None = None
+
+    try:
+        tester = LatencyTester(
+            env=load_configuration_environment(),
+            prompts=prompts,
+        )
+        if not args.skip_warmup:
+            tester.warmup_clients()
+        results = tester.run_tests(iterations=args.iterations)
         tester.analyze_results(results)
-        
-        # Save results
-        tester.save_results(results)
-    except Exception as e:
-        print(f"Error: {e}")
+        tester.save_results(results, args.output)
+        return 1 if any(not result["success"] for result in results) else 0
+    except (ValueError, RuntimeError, OpenAIError, AzureError) as error:
+        print(f"Error: {error}")
+        return 1
+    finally:
+        if tester is not None:
+            tester.close()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
