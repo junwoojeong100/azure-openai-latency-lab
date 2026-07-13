@@ -1,6 +1,6 @@
 # Azure OpenAI GPT Reasoning Effort Latency Lab
 
-Azure OpenAI에 배포한 GPT 모델을 동일한 프롬프트로 호출하여 **비스트리밍 전체 응답 지연시간**과 토큰 사용량을 비교하는 실습입니다. 표준 `openai` Python SDK의 Azure OpenAI **v1 API**, Microsoft Entra ID 인증, Chat Completions API를 사용합니다.
+Azure OpenAI에 배포한 GPT 모델을 동일한 프롬프트로 호출하여 **비스트리밍 전체 응답 지연시간**과 토큰 사용량을 비교하는 실습입니다. 표준 `openai` Python SDK의 Azure OpenAI **v1 API**와 Microsoft Entra ID 인증을 사용하며, GPT-4.x는 Chat Completions API, GPT-5.x는 Responses API로 호출합니다.
 
 > 이 도구는 Azure에 존재하는 모든 배포를 자동 조회하지 않습니다. `.env`에 명시한 배포만 테스트합니다.
 
@@ -8,24 +8,24 @@ Azure OpenAI에 배포한 GPT 모델을 동일한 프롬프트로 호출하여 *
 
 Azure의 배포 이름은 사용자가 자유롭게 정할 수 있으므로, 모델 종류는 배포 이름 값이 아니라 환경 변수 키로 판별합니다.
 
-| 환경 변수 | 모델 | 적용하는 `reasoning_effort` |
-| --- | --- | --- |
-| `GPT_41_DEPLOYMENT_NAME` | `gpt-4.1` | 미적용 |
-| `GPT_4O_DEPLOYMENT_NAME` | `gpt-4o` | 미적용 |
-| `GPT_51_DEPLOYMENT_NAME` | `gpt-5.1` | `high`, `medium`, `low`, `none` |
-| `GPT_52_DEPLOYMENT_NAME` | `gpt-5.2` | `xhigh`, `high`, `medium`, `low`, `none` |
-| `GPT_54_DEPLOYMENT_NAME` | `gpt-5.4` | `xhigh`, `high`, `medium`, `low`, `none` |
-| `GPT_54_MINI_DEPLOYMENT_NAME` | `gpt-5.4-mini` | `xhigh`, `high`, `medium`, `low`, `none` |
-| `GPT_54_NANO_DEPLOYMENT_NAME` | `gpt-5.4-nano` | `xhigh`, `high`, `medium`, `low`, `none` |
-| `GPT_56_SOL_DEPLOYMENT_NAME` | `gpt-5.6-sol` | `xhigh`, `high`, `medium`, `low`, `none` |
-| `GPT_56_TERRA_DEPLOYMENT_NAME` | `gpt-5.6-terra` | `xhigh`, `high`, `medium`, `low`, `none` |
-| `GPT_56_LUNA_DEPLOYMENT_NAME` | `gpt-5.6-luna` | `xhigh`, `high`, `medium`, `low`, `none` |
+| 환경 변수 | 모델 | API | 적용하는 reasoning effort |
+| --- | --- | --- | --- |
+| `GPT_41_DEPLOYMENT_NAME` | `gpt-4.1` | Chat Completions | 미적용 |
+| `GPT_4O_DEPLOYMENT_NAME` | `gpt-4o` | Chat Completions | 미적용 |
+| `GPT_51_DEPLOYMENT_NAME` | `gpt-5.1` | Responses | `high`, `medium`, `low`, `none` |
+| `GPT_52_DEPLOYMENT_NAME` | `gpt-5.2` | Responses | `xhigh`, `high`, `medium`, `low`, `none` |
+| `GPT_54_DEPLOYMENT_NAME` | `gpt-5.4` | Responses | `xhigh`, `high`, `medium`, `low`, `none` |
+| `GPT_54_MINI_DEPLOYMENT_NAME` | `gpt-5.4-mini` | Responses | `xhigh`, `high`, `medium`, `low`, `none` |
+| `GPT_54_NANO_DEPLOYMENT_NAME` | `gpt-5.4-nano` | Responses | `xhigh`, `high`, `medium`, `low`, `none` |
+| `GPT_56_SOL_DEPLOYMENT_NAME` | `gpt-5.6-sol` | Responses | `max`, `xhigh`, `high`, `medium`, `low`, `none` |
+| `GPT_56_TERRA_DEPLOYMENT_NAME` | `gpt-5.6-terra` | Responses | `max`, `xhigh`, `high`, `medium`, `low`, `none` |
+| `GPT_56_LUNA_DEPLOYMENT_NAME` | `gpt-5.6-luna` | Responses | `max`, `xhigh`, `high`, `medium`, `low`, `none` |
 
 GPT-5.6의 Sol은 최고 성능, Terra는 성능과 비용의 균형, Luna는 비용 민감형 대량 워크로드를 위한 모델입니다. `gpt-5.6` 별칭은 Sol로 연결되지만, 비교 결과를 명확히 하기 위해 이 실습은 세 모델 ID를 직접 사용합니다.
 
-`minimal`은 이 실습의 GPT-5.1 이상 모델 조합에 유효하지 않으므로 설정 단계에서 오류로 처리합니다. `xhigh`는 이를 지원하는 모델에서만 실행되며 나머지 모델에서는 자동으로 제외됩니다.
+`minimal`은 이 실습의 GPT-5.1 이상 모델 조합에 유효하지 않으므로 설정 단계에서 오류로 처리합니다. `max`는 GPT-5.6에서만, `xhigh`는 이를 지원하는 모델에서만 실행되며 나머지 모델에서는 자동으로 제외됩니다.
 
-GPT-5.6의 `max` effort와 pro mode는 Responses API 기능입니다. 이 실습은 모든 모델을 동일한 Chat Completions API로 비교하므로 `max`와 pro mode는 포함하지 않습니다.
+GPT-5.6의 `max` effort도 기본 비교 대상에 포함합니다. Pro mode는 reasoning effort와 별개의 실행 모드이므로 이 실습에서는 기본 `standard` mode만 측정합니다.
 
 ## 사전 준비
 
@@ -101,10 +101,10 @@ AZURE_AI_PROJECT_ENDPOINT=https://your-resource.services.ai.azure.com/api/projec
 ### 선택 설정
 
 ```dotenv
-# 비워 두면 모델별 지원 effort 전체를 높은 순서로 실행
-REASONING_EFFORTS=xhigh,high,medium,low,none
+# 비워 두면 GPT-5.x 모델별 지원 effort 전체를 높은 순서로 실행
+REASONING_EFFORTS=max,xhigh,high,medium,low,none
 
-# 일반 모델은 max_tokens, reasoning 모델은 max_completion_tokens에 적용
+# GPT-4.x의 max_tokens와 GPT-5.x의 max_output_tokens에 적용
 MAX_OUTPUT_TOKENS=4096
 
 REQUEST_TIMEOUT_SECONDS=120
@@ -149,15 +149,17 @@ python test_latency.py --iterations 3
 - 레이턴시는 요청 전송 직전부터 비스트리밍 전체 응답 수신까지의 시간입니다. 첫 토큰 지연시간(TTFT)이 아닙니다.
 - 콘솔에는 모델/effort별 평균, 최소, 최대, 표준편차, 평균 토큰, 평균 reasoning 토큰을 출력합니다.
 - CSV에는 모델 ID와 실제 배포 이름을 별도 컬럼으로 저장하며, `response`는 공백을 정리한 앞 200자의 미리보기입니다.
-- 개별 API 호출 실패와 `finish_reason=length` 같은 잘린 응답도 CSV에 기록하며, 하나라도 있으면 프로세스가 종료 코드 `1`을 반환합니다.
-- reasoning 모델에는 `max_completion_tokens`, GPT-4.x 모델에는 `max_tokens`를 사용합니다.
+- 개별 API 호출 실패, Chat Completions의 `finish_reason=length`, Responses의 `status=incomplete`도 CSV에 기록하며, 하나라도 있으면 프로세스가 종료 코드 `1`을 반환합니다.
+- GPT-4.x에는 `max_tokens`, GPT-5.x에는 `max_output_tokens`를 사용합니다.
+- GPT-5.x에는 `reasoning={"effort": ...}`를 전송하고 응답 저장을 비활성화하기 위해 `store=false`를 사용합니다.
 - reasoning 모델에 지원되지 않는 `temperature`, `top_p`, `logprobs` 등의 파라미터는 전송하지 않습니다.
 
 기본 출력 파일은 `latency_results.csv`이며 다음 컬럼을 포함합니다.
 
 ```text
-model,deployment,prompt,reasoning_effort,latency_ms,tokens,completion_tokens,
-prompt_tokens,reasoning_tokens,response,finish_reason,success,error,iteration,timestamp
+model,deployment,api,prompt,reasoning_effort,latency_ms,tokens,output_tokens,
+input_tokens,reasoning_tokens,response,status,incomplete_reason,success,error,
+iteration,timestamp
 ```
 
 ## 문제 해결
@@ -168,15 +170,16 @@ prompt_tokens,reasoning_tokens,response,finish_reason,success,error,iteration,ti
 | `404` 또는 deployment not found | `.env` 값이 모델 ID가 아니라 실제 Azure **배포 이름**인지 확인 |
 | endpoint 형식 오류 | 리소스 엔드포인트 또는 `/api/projects/<project>` 형식을 사용했는지 확인 |
 | 사용자 지정 프록시 또는 다른 클라우드 도메인 | 이 도구는 공개 Azure의 공식 OpenAI/Foundry 호스트만 허용 |
-| effort 설정 오류 | `minimal`을 제거하고 지원 표의 값을 사용 |
+| effort 설정 오류 | `minimal`을 제거하고 모델별 지원 표의 값을 사용 |
 | 일부 지역에서 모델 배포 불가 | Azure 모델 지역 가용성과 구독 quota 확인 |
-| `finish_reason=length` 또는 빈 응답 | `MAX_OUTPUT_TOKENS`를 늘리거나 프롬프트의 응답 길이를 축소 |
-| `finish_reason=content_filter` | 프롬프트와 Azure OpenAI 콘텐츠 필터 정책 확인 |
-| GPT-5.6 `max` 또는 pro mode 측정 필요 | Responses API 전용 기능이므로 이 Chat Completions 실습과 별도로 측정 |
+| `finish_reason=length`, `incomplete_reason=max_output_tokens` 또는 빈 응답 | `MAX_OUTPUT_TOKENS`를 늘리거나 프롬프트의 응답 길이를 축소 |
+| `finish_reason=content_filter` 또는 `incomplete_reason=content_filter` | 프롬프트와 Azure OpenAI 콘텐츠 필터 정책 확인 |
+| GPT-5.6 pro mode 측정 필요 | 현재 실습은 standard mode만 측정하므로 별도 구성으로 비교 |
 
 ## 참고 문서
 
 - [Azure OpenAI v1 API](https://learn.microsoft.com/azure/foundry/openai/api-version-lifecycle)
+- [Azure OpenAI Responses API](https://learn.microsoft.com/azure/foundry/openai/how-to/responses)
 - [Azure OpenAI reasoning models](https://learn.microsoft.com/azure/foundry/openai/how-to/reasoning)
 - [Azure OpenAI RBAC](https://learn.microsoft.com/azure/ai-foundry/openai/how-to/role-based-access-control)
 - [OpenAI GPT-5.4 model](https://developers.openai.com/api/docs/models/gpt-5.4)

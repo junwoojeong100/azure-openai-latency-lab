@@ -1,4 +1,4 @@
-"""Compare Azure OpenAI chat-completion latency across configured deployments."""
+"""Compare Azure OpenAI latency across configured model deployments."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import fmean, pstdev
-from typing import Any, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence
 from urllib.parse import urlsplit
 
 from azure.core.exceptions import AzureError
@@ -21,7 +21,11 @@ from dotenv import dotenv_values
 from openai import OpenAI, OpenAIError
 
 
-EFFORT_ORDER = ("xhigh", "high", "medium", "low", "none")
+ApiName = Literal["chat_completions", "responses"]
+
+CHAT_COMPLETIONS_API: ApiName = "chat_completions"
+RESPONSES_API: ApiName = "responses"
+EFFORT_ORDER = ("max", "xhigh", "high", "medium", "low", "none")
 DEFAULT_TOKEN_SCOPE = "https://ai.azure.com/.default"
 DEFAULT_MAX_OUTPUT_TOKENS = 4096
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 120.0
@@ -37,15 +41,17 @@ AZURE_RESOURCE_NAME_PATTERN = re.compile(
 CSV_FIELDS = (
     "model",
     "deployment",
+    "api",
     "prompt",
     "reasoning_effort",
     "latency_ms",
     "tokens",
-    "completion_tokens",
-    "prompt_tokens",
+    "output_tokens",
+    "input_tokens",
     "reasoning_tokens",
     "response",
-    "finish_reason",
+    "status",
+    "incomplete_reason",
     "success",
     "error",
     "iteration",
@@ -56,6 +62,7 @@ CSV_FIELDS = (
 @dataclass(frozen=True)
 class ModelDefinition:
     model_id: str
+    api: ApiName
     supported_efforts: tuple[str, ...] = ()
 
 
@@ -63,6 +70,7 @@ class ModelDefinition:
 class TestConfiguration:
     model_id: str
     deployment_name: str
+    api: ApiName
     reasoning_effort: str | None = None
 
     @property
@@ -75,34 +83,62 @@ class TestConfiguration:
         return model_label
 
 
+@dataclass(frozen=True)
+class ParsedModelResponse:
+    total_tokens: int | None
+    output_tokens: int | None
+    input_tokens: int | None
+    reasoning_tokens: int | None
+    content: str
+    status: str | None
+    incomplete_reason: str | None
+    error: str | None
+
+
 # Deployment names in Azure are user-defined, so capabilities must come from the
 # environment-variable key rather than from the deployment-name value.
 MODEL_DEFINITIONS: dict[str, ModelDefinition] = {
-    "GPT_41_DEPLOYMENT_NAME": ModelDefinition("gpt-4.1"),
-    "GPT_4O_DEPLOYMENT_NAME": ModelDefinition("gpt-4o"),
+    "GPT_41_DEPLOYMENT_NAME": ModelDefinition("gpt-4.1", CHAT_COMPLETIONS_API),
+    "GPT_4O_DEPLOYMENT_NAME": ModelDefinition("gpt-4o", CHAT_COMPLETIONS_API),
     "GPT_51_DEPLOYMENT_NAME": ModelDefinition(
-        "gpt-5.1", ("high", "medium", "low", "none")
+        "gpt-5.1",
+        RESPONSES_API,
+        ("high", "medium", "low", "none"),
     ),
     "GPT_52_DEPLOYMENT_NAME": ModelDefinition(
-        "gpt-5.2", ("xhigh", "high", "medium", "low", "none")
+        "gpt-5.2",
+        RESPONSES_API,
+        ("xhigh", "high", "medium", "low", "none"),
     ),
     "GPT_54_DEPLOYMENT_NAME": ModelDefinition(
-        "gpt-5.4", ("xhigh", "high", "medium", "low", "none")
+        "gpt-5.4",
+        RESPONSES_API,
+        ("xhigh", "high", "medium", "low", "none"),
     ),
     "GPT_54_MINI_DEPLOYMENT_NAME": ModelDefinition(
-        "gpt-5.4-mini", ("xhigh", "high", "medium", "low", "none")
+        "gpt-5.4-mini",
+        RESPONSES_API,
+        ("xhigh", "high", "medium", "low", "none"),
     ),
     "GPT_54_NANO_DEPLOYMENT_NAME": ModelDefinition(
-        "gpt-5.4-nano", ("xhigh", "high", "medium", "low", "none")
+        "gpt-5.4-nano",
+        RESPONSES_API,
+        ("xhigh", "high", "medium", "low", "none"),
     ),
     "GPT_56_SOL_DEPLOYMENT_NAME": ModelDefinition(
-        "gpt-5.6-sol", ("xhigh", "high", "medium", "low", "none")
+        "gpt-5.6-sol",
+        RESPONSES_API,
+        ("max", "xhigh", "high", "medium", "low", "none"),
     ),
     "GPT_56_TERRA_DEPLOYMENT_NAME": ModelDefinition(
-        "gpt-5.6-terra", ("xhigh", "high", "medium", "low", "none")
+        "gpt-5.6-terra",
+        RESPONSES_API,
+        ("max", "xhigh", "high", "medium", "low", "none"),
     ),
     "GPT_56_LUNA_DEPLOYMENT_NAME": ModelDefinition(
-        "gpt-5.6-luna", ("xhigh", "high", "medium", "low", "none")
+        "gpt-5.6-luna",
+        RESPONSES_API,
+        ("max", "xhigh", "high", "medium", "low", "none"),
     ),
 }
 
@@ -273,7 +309,9 @@ def build_model_configs(
     """Expand configured deployments into valid model and effort combinations."""
     source = os.environ if env is None else env
     model_environment = normalize_model_environment(source)
-    requested_efforts = list(efforts) if efforts is not None else get_reasoning_efforts(source)
+    requested_efforts = (
+        list(efforts) if efforts is not None else get_reasoning_efforts(source)
+    )
 
     unknown_keys = sorted(
         key
@@ -304,7 +342,11 @@ def build_model_configs(
 
         if not definition.supported_efforts:
             configurations.append(
-                TestConfiguration(definition.model_id, deployment_name)
+                TestConfiguration(
+                    definition.model_id,
+                    deployment_name,
+                    definition.api,
+                )
             )
             continue
 
@@ -321,7 +363,12 @@ def build_model_configs(
             )
 
         configurations.extend(
-            TestConfiguration(definition.model_id, deployment_name, effort)
+            TestConfiguration(
+                definition.model_id,
+                deployment_name,
+                definition.api,
+                effort,
+            )
             for effort in model_efforts
         )
 
@@ -361,24 +408,42 @@ def get_positive_float(
     return value
 
 
-def build_completion_params(
+def build_chat_completion_params(
     configuration: TestConfiguration, prompt: str, max_output_tokens: int
 ) -> dict[str, Any]:
-    """Build parameters accepted by the selected Chat Completions model."""
-    params: dict[str, Any] = {
+    """Build a GPT-4.x Chat Completions request."""
+    if configuration.api != CHAT_COMPLETIONS_API:
+        raise ValueError("Chat Completions parameters require a GPT-4.x configuration.")
+    if configuration.reasoning_effort is not None:
+        raise ValueError("GPT-4.x Chat Completions must not set reasoning_effort.")
+    return {
         "model": configuration.deployment_name,
         "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_output_tokens,
     }
+
+
+def build_responses_params(
+    configuration: TestConfiguration, prompt: str, max_output_tokens: int
+) -> dict[str, Any]:
+    """Build a GPT-5.x Responses API request."""
+    if configuration.api != RESPONSES_API:
+        raise ValueError("Responses parameters require a GPT-5.x configuration.")
     if configuration.reasoning_effort is None:
-        params["max_tokens"] = max_output_tokens
-    else:
-        params["reasoning_effort"] = configuration.reasoning_effort
-        params["max_completion_tokens"] = max_output_tokens
-    return params
+        raise ValueError("GPT-5.x Responses requests require reasoning_effort.")
+    return {
+        "model": configuration.deployment_name,
+        "input": prompt,
+        "reasoning": {"effort": configuration.reasoning_effort},
+        "max_output_tokens": max_output_tokens,
+        "store": False,
+    }
 
 
-def get_completion_error(finish_reason: str | None, content: str) -> str | None:
-    """Return an actionable error when a text completion is incomplete."""
+def get_chat_completion_error(
+    finish_reason: str | None, content: str
+) -> str | None:
+    """Return an actionable error for an incomplete Chat Completions response."""
     if finish_reason == "length":
         return (
             "Incomplete response (finish_reason='length'). "
@@ -391,6 +456,100 @@ def get_completion_error(finish_reason: str | None, content: str) -> str | None:
     if not content.strip():
         return "The model returned an empty response."
     return None
+
+
+def get_responses_error(
+    status: str | None,
+    incomplete_reason: str | None,
+    content: str,
+    failure: str | None = None,
+) -> str | None:
+    """Return an actionable error for an incomplete Responses API response."""
+    if status == "completed":
+        if not content.strip():
+            return "The model returned an empty response."
+        return None
+    if status == "incomplete":
+        if incomplete_reason == "max_output_tokens":
+            return (
+                "Incomplete response (reason='max_output_tokens'). "
+                "Increase MAX_OUTPUT_TOKENS or shorten the prompt."
+            )
+        if incomplete_reason == "content_filter":
+            return "The response was blocked by the Azure OpenAI content filter."
+        return f"Incomplete response (reason={incomplete_reason!r})."
+    if status == "failed" and failure:
+        return f"Response failed: {failure}"
+    if status == "failed":
+        return "Response failed without error details."
+    return f"Incomplete response (status={status!r})."
+
+
+def parse_chat_completion_response(response: Any) -> ParsedModelResponse:
+    """Normalize a Chat Completions response."""
+    usage = response.usage
+    reasoning_tokens = None
+    if usage is not None:
+        details = getattr(usage, "completion_tokens_details", None)
+        if details is not None:
+            reasoning_tokens = getattr(details, "reasoning_tokens", None)
+
+    choice = response.choices[0] if response.choices else None
+    content = ""
+    finish_reason = None
+    if choice is not None:
+        content = choice.message.content or ""
+        finish_reason = choice.finish_reason
+
+    return ParsedModelResponse(
+        total_tokens=usage.total_tokens if usage is not None else None,
+        output_tokens=usage.completion_tokens if usage is not None else None,
+        input_tokens=usage.prompt_tokens if usage is not None else None,
+        reasoning_tokens=reasoning_tokens,
+        content=content,
+        status=finish_reason,
+        incomplete_reason=None,
+        error=get_chat_completion_error(finish_reason, content),
+    )
+
+
+def parse_responses_api_response(response: Any) -> ParsedModelResponse:
+    """Normalize a Responses API response."""
+    usage = response.usage
+    reasoning_tokens = None
+    if usage is not None:
+        details = getattr(usage, "output_tokens_details", None)
+        if details is not None:
+            reasoning_tokens = getattr(details, "reasoning_tokens", None)
+
+    incomplete_details = response.incomplete_details
+    incomplete_reason = (
+        incomplete_details.reason if incomplete_details is not None else None
+    )
+    response_error = response.error
+    failure = None
+    if response_error is not None:
+        code = getattr(response_error, "code", None)
+        message = getattr(response_error, "message", None)
+        if code and message:
+            failure = f"{code}: {message}"
+        elif message:
+            failure = str(message)
+        elif code:
+            failure = str(code)
+
+    content = response.output_text or ""
+    status = response.status
+    return ParsedModelResponse(
+        total_tokens=usage.total_tokens if usage is not None else None,
+        output_tokens=usage.output_tokens if usage is not None else None,
+        input_tokens=usage.input_tokens if usage is not None else None,
+        reasoning_tokens=reasoning_tokens,
+        content=content,
+        status=status,
+        incomplete_reason=incomplete_reason,
+        error=get_responses_error(status, incomplete_reason, content, failure),
+    )
 
 
 class LatencyTester:
@@ -448,17 +607,42 @@ class LatencyTester:
         print("Azure OpenAI latency comparison")
         print(f"  Endpoint source: {endpoint_source}")
         print("  API:             /openai/v1/ (no dated api-version)")
+        print("  Routing:         GPT-4.x Chat Completions; GPT-5.x Responses")
         print(f"  Token scope:     {token_scope}")
         print(f"  Output limit:    {self.max_output_tokens} tokens")
         print(f"  Configurations:  {len(self.configurations)}")
         for configuration in self.configurations:
-            print(f"    - {configuration.label}")
+            print(f"    - {configuration.label} via {configuration.api}")
 
     def close(self) -> None:
         try:
             self.client.close()
         finally:
             self.credential.close()
+
+    def _create_model_response(
+        self,
+        configuration: TestConfiguration,
+        prompt: str,
+        max_output_tokens: int,
+    ) -> Any:
+        if configuration.api == CHAT_COMPLETIONS_API:
+            return self.client.chat.completions.create(
+                **build_chat_completion_params(
+                    configuration,
+                    prompt,
+                    max_output_tokens,
+                )
+            )
+        if configuration.api == RESPONSES_API:
+            return self.client.responses.create(
+                **build_responses_params(
+                    configuration,
+                    prompt,
+                    max_output_tokens,
+                )
+            )
+        raise ValueError(f"Unsupported API routing value: {configuration.api!r}.")
 
     def warmup_clients(self) -> None:
         """Warm each deployment once and fail before the measured run on an error."""
@@ -482,15 +666,14 @@ class LatencyTester:
                 ),
                 configurations[-1],
             )
-            params = build_completion_params(
-                warmup_configuration,
-                "Reply with OK.",
-                min(self.max_output_tokens, 32),
-            )
             print(f"Warming up {warmup_configuration.label}...", end=" ", flush=True)
             started = time.perf_counter()
             try:
-                self.client.chat.completions.create(**params)
+                self._create_model_response(
+                    warmup_configuration,
+                    "Reply with OK.",
+                    min(self.max_output_tokens, 32),
+                )
                 elapsed_ms = (time.perf_counter() - started) * 1000
                 print(f"{elapsed_ms:.0f}ms")
             except (OpenAIError, AzureError) as error:
@@ -507,58 +690,53 @@ class LatencyTester:
         """Measure one non-streaming request from send to complete response."""
         started = time.perf_counter()
         try:
-            response = self.client.chat.completions.create(
-                **build_completion_params(
-                    configuration, prompt, self.max_output_tokens
-                )
+            response = self._create_model_response(
+                configuration,
+                prompt,
+                self.max_output_tokens,
             )
             latency_ms = (time.perf_counter() - started) * 1000
         except (OpenAIError, AzureError) as error:
             return {
                 "model": configuration.model_id,
                 "deployment": configuration.deployment_name,
+                "api": configuration.api,
                 "prompt": prompt,
                 "reasoning_effort": configuration.reasoning_effort,
                 "latency_ms": None,
                 "tokens": None,
-                "completion_tokens": None,
-                "prompt_tokens": None,
+                "output_tokens": None,
+                "input_tokens": None,
                 "reasoning_tokens": None,
                 "response": None,
-                "finish_reason": None,
+                "status": None,
+                "incomplete_reason": None,
                 "success": False,
                 "error": str(error),
             }
 
-        usage = response.usage
-        reasoning_tokens = None
-        if usage is not None:
-            details = getattr(usage, "completion_tokens_details", None)
-            if details is not None:
-                reasoning_tokens = getattr(details, "reasoning_tokens", None)
-
-        choice = response.choices[0] if response.choices else None
-        content = choice.message.content or "" if choice is not None else ""
-        finish_reason = choice.finish_reason if choice is not None else None
-        response_preview = " ".join(content.split())[:200]
-        completion_error = get_completion_error(finish_reason, content)
+        if configuration.api == CHAT_COMPLETIONS_API:
+            parsed = parse_chat_completion_response(response)
+        else:
+            parsed = parse_responses_api_response(response)
+        response_preview = " ".join(parsed.content.split())[:200]
 
         return {
             "model": configuration.model_id,
             "deployment": configuration.deployment_name,
+            "api": configuration.api,
             "prompt": prompt,
             "reasoning_effort": configuration.reasoning_effort,
             "latency_ms": round(latency_ms, 2),
-            "tokens": usage.total_tokens if usage is not None else None,
-            "completion_tokens": (
-                usage.completion_tokens if usage is not None else None
-            ),
-            "prompt_tokens": usage.prompt_tokens if usage is not None else None,
-            "reasoning_tokens": reasoning_tokens,
+            "tokens": parsed.total_tokens,
+            "output_tokens": parsed.output_tokens,
+            "input_tokens": parsed.input_tokens,
+            "reasoning_tokens": parsed.reasoning_tokens,
             "response": response_preview,
-            "finish_reason": finish_reason,
-            "success": completion_error is None,
-            "error": completion_error,
+            "status": parsed.status,
+            "incomplete_reason": parsed.incomplete_reason,
+            "success": parsed.error is None,
+            "error": parsed.error,
         }
 
     def run_tests(self, iterations: int = 1) -> list[dict[str, Any]]:
